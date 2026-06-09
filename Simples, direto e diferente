@@ -1,0 +1,227 @@
+package dio.budgeting;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.*;
+import org.springframework.stereotype.*;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.http.*;
+import org.springframework.core.io.*;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiAudioSpeechModel;
+import org.springframework.ai.openai.OpenAiAudioTranscriptionModel;
+import org.springframework.ai.openai.audio.speech.SpeechPrompt;
+import org.springframework.ai.openai.audio.transcription.AudioTranscriptionPrompt;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.function.Function;
+
+@SpringBootApplication
+public class BudgetingApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(BudgetingApplication.class, args);
+    }
+
+    // =====================================================
+    //  DOMAIN regras do negócio
+    // =====================================================
+
+    enum TransactionType {
+        EXPENSE,
+        INCOME
+    }
+
+    static class Transaction {
+
+        private Long id;
+        private String description;
+        private BigDecimal amount;
+        private TransactionType type;
+        private LocalDateTime createdAt;
+
+        public Transaction(String description, BigDecimal amount, TransactionType type) {
+
+            if (description == null || description.isBlank()) {
+                throw new IllegalArgumentException("Descrição não pode ser vazia.");
+            }
+
+            if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+                throw new IllegalArgumentException("Valor precisa ser maior que zero.");
+            }
+
+            this.description = description;
+            this.amount = amount;
+            this.type = type;
+            this.createdAt = LocalDateTime.now();
+        }
+
+        public void setId(Long id) { this.id = id; }
+        public Long getId() { return id; }
+        public String getDescription() { return description; }
+        public BigDecimal getAmount() { return amount; }
+        public TransactionType getType() { return type; }
+        public LocalDateTime getCreatedAt() { return createdAt; }
+    }
+
+    // ====================================
+    //  REPOSITORY simples em memória
+    // ====================================
+
+    interface TransactionRepository {
+        Transaction save(Transaction transaction);
+        List<Transaction> findAll();
+    }
+
+    @Repository
+    static class InMemoryTransactionRepository implements TransactionRepository {
+
+        private final List<Transaction> database = new ArrayList<>();
+        private long idSequence = 1;
+
+        @Override
+        public synchronized Transaction save(Transaction transaction) {
+            transaction.setId(idSequence++);
+            database.add(transaction);
+            return transaction;
+        }
+
+        @Override
+        public List<Transaction> findAll() {
+            return new ArrayList<>(database);
+        }
+    }
+
+    // ======================================
+    //  USE CASE Regra de Aplicação
+    // ======================================
+
+    @Service
+    static class CreateTransactionUseCase {
+
+        private final TransactionRepository repository;
+
+        public CreateTransactionUseCase(TransactionRepository repository) {
+            this.repository = repository;
+        }
+
+        public String execute(String description, double amount, String type) {
+
+            // tenta entender se é gasto ou ganho
+            TransactionType transactionType;
+            try {
+                transactionType = TransactionType.valueOf(type.toUpperCase());
+            } catch (Exception e) {
+                return "Não entendi se isso é um gasto ou ganho ";
+            }
+
+            try {
+                var transaction = new Transaction(
+                        description,
+                        BigDecimal.valueOf(amount),
+                        transactionType
+                );
+
+                repository.save(transaction);
+
+                return String.format(
+                        "Pronto! Anotei %s de R$ %.2f (%s) ",
+                        transaction.getType(),
+                        transaction.getAmount(),
+                        transaction.getDescription()
+                );
+
+            } catch (Exception e) {
+                return "Deu erro ao salvar ";
+            }
+        }
+    }
+
+    // =====================================================
+    //  CONFIG IA + tool
+    // =====================================================
+
+    @Configuration
+    static class TransactionTools {
+
+        private final CreateTransactionUseCase useCase;
+
+        public TransactionTools(CreateTransactionUseCase useCase) {
+            this.useCase = useCase;
+        }
+
+        // estrutura que a IA usa
+        public record TransactionRequest(String description, double amount, String type) {}
+
+        @Bean
+        @Description("Cria uma transação financeira com base no que o usuário falou")
+        public Function<TransactionRequest, String> createTransactionTool() {
+            return request -> useCase.execute(
+                    request.description(),
+                    request.amount(),
+                    request.type()
+            );
+        }
+    }
+
+    // =====================================================
+    //  CONTROLLER (entrada HTTP)
+    // =====================================================
+
+    @RestController
+    @RequestMapping("/api/budget/voice")
+    static class BudgetAIController {
+
+        private final OpenAiAudioTranscriptionModel transcriptionModel;
+        private final OpenAiAudioSpeechModel speechModel;
+        private final ChatClient chatClient;
+
+        public BudgetAIController(OpenAiAudioTranscriptionModel transcriptionModel,
+                                  OpenAiAudioSpeechModel speechModel,
+                                  ChatClient.Builder builder) {
+
+            this.transcriptionModel = transcriptionModel;
+            this.speechModel = speechModel;
+
+            this.chatClient = builder
+                    .defaultSystem("Você é uma IA financeira simples e amigável. Seja direta.")
+                    .build();
+        }
+
+        @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = "audio/mpeg")
+        public ResponseEntity<Resource> process(@RequestParam("audio") MultipartFile audioFile) {
+
+            try {
+                // 1. transforma o áudio em texto
+                var texto = transcriptionModel
+                        .call(new AudioTranscriptionPrompt(audioFile.getResource()))
+                        .getResult()
+                        .getOutput();
+
+                // 2. manda pra IA decidir o que fazer
+                var resposta = chatClient.prompt()
+                        .user(texto)
+                        .functions("createTransactionTool")
+                        .call()
+                        .content();
+
+                // 3. transforma resposta em áudio
+                byte[] audio = speechModel
+                        .call(new SpeechPrompt(resposta))
+                        .getResult()
+                        .getOutput();
+
+                return ResponseEntity.ok()
+                        .contentType(MediaType.parseMediaType("audio/mpeg"))
+                        .body(new ByteArrayResource(audio));
+
+            } catch (Exception e) {
+                return ResponseEntity.internalServerError().build();
+            }
+        }
+    }
+}
